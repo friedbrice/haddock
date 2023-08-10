@@ -46,6 +46,7 @@ import Data.ByteString.Builder (Builder)
 import qualified Data.ByteString.Builder as BB
 import Data.Char
 import Data.Int
+import Data.Kind
 import Data.Word
 import Data.List (intersperse)
 import Data.Monoid
@@ -253,18 +254,17 @@ data JSONPathElement
 type JSONPath = [JSONPathElement]
 
 -- | Failure continuation.
+type Failure :: (Type -> Type) -> Type -> Type
 type Failure f r   = JSONPath -> String -> f r
 
 -- | Success continuation.
+type Success :: Type -> (Type -> Type) -> Type -> Type
 type Success a f r = a -> f r
 
-newtype Parser a = Parser {
-      runParser :: forall f r.
-                   JSONPath
-                -> Failure f r
-                -> Success a f r
-                -> f r
-    }
+data Parser a = Parser !(forall (f :: Type -> Type) (r :: Type). JSONPath -> Failure f r -> Success a f r -> f r)
+
+runParser :: forall a. Parser a -> (forall (f :: Type -> Type) (r :: Type). JSONPath -> Failure f r -> Success a f r -> f r)
+runParser (Parser parser) = \path failure success -> parser path failure success
 
 modifyFailure :: (String -> String) -> Parser a -> Parser a
 modifyFailure f (Parser p) = Parser $ \path kf ks ->
@@ -555,4 +555,3 @@ eitherDecodeFile filePath = do
           Success a -> return (Right a)
           Error err -> return (Left err)
       Left err -> return $ Left (show err)
-

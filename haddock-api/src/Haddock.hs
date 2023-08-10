@@ -145,7 +145,7 @@ handleGhcExceptions =
 --
 -- Haddock's own main function is defined in terms of this:
 --
--- > main = getArgs >>= haddock
+-- > main = getArgsWithResponseFiles >>= haddock
 haddock :: [String] -> IO ()
 haddock args = haddockWithGhc withGhc args
 
@@ -575,9 +575,9 @@ withGhc' libDir needHieFiles flags ghcActs = runGhc (Just libDir) $ do
 
     dynflags' <- parseGhcFlags logger default_dflags
 
-    -- Disable pattern match warnings because they can be very expensive to
-    -- check, set optimization level to 0 for fastest compilation.
-    let dynflags'' = unsetPatternMatchWarnings $ updOptLevel 0 dynflags'
+    -- Disable warnings because why bother.
+    -- Set optimization level to 0 for fastest compilation.
+    let dynflags'' = unsetWarnings $ updOptLevel 0 dynflags'
 
     -- ignore the following return-value, which is a list of packages
     -- that may need to be re-linked: Haddock doesn't do any
@@ -622,16 +622,9 @@ withGhc' libDir needHieFiles flags ghcActs = runGhc (Just libDir) $ do
         then throwE ("Couldn't parse GHC options: " ++ unwords flags')
         else return dynflags''
 
-unsetPatternMatchWarnings :: DynFlags -> DynFlags
-unsetPatternMatchWarnings dflags =
-  foldl' wopt_unset dflags pattern_match_warnings
-  where
-    pattern_match_warnings =
-      [ Opt_WarnIncompletePatterns
-      , Opt_WarnIncompleteUniPatterns
-      , Opt_WarnIncompletePatternsRecUpd
-      , Opt_WarnOverlappingPatterns
-      ]
+unsetWarnings :: DynFlags -> DynFlags
+unsetWarnings dflags =
+  foldl' wopt_unset dflags [Opt_WarnDuplicateExports .. Opt_WarnLoopySuperclassSolve]
 
 -------------------------------------------------------------------------------
 -- * Misc
@@ -817,4 +810,3 @@ getPrologue dflags flags =
 rightOrThrowE :: Either String b -> IO b
 rightOrThrowE (Left msg) = throwE msg
 rightOrThrowE (Right x) = pure x
-
