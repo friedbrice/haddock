@@ -20,7 +20,8 @@ module Haddock.InterfaceFile (
   PackageInterfaces(..), mkPackageInterfaces, ppPackageInfo,
   readInterfaceFile, writeInterfaceFile,
   freshNameCache,
-  binaryInterfaceVersion, binaryInterfaceVersionCompatibility
+  binaryInterfaceVersion, binaryInterfaceVersionCompatibility,
+  PackageBase(..), InterfaceBase(..), LinkBase(..), emptyInterfaceBase
 ) where
 
 
@@ -42,8 +43,51 @@ import GHC hiding (NoLink)
 import GHC.Types.Name.Cache
 import GHC.Types.Unique.FM
 import GHC.Types.Unique
+import GHC.Unit.Module.Env
 
 import Haddock.Options (Visibility (..))
+
+data PackageBase = PackageBase
+  { countPackages :: IO Int
+  , forPackages :: ((DocPaths, Visibility, FilePath, InterfaceFile) -> IO ()) -> IO ()
+  , installedInterfaceByModule :: Module -> IO (Maybe InstalledInterface)
+  -- extSrcMap :: Map Module FilePath
+  -- installedIfaces :: [(FilePath, PackageInterfaces)]
+  -- allInstalledIfaces :: [InstalledInterface]
+  -- installedMap :: Map Module InstalledInterface
+  }
+
+-- PackageBase -> InterfaceBase -> allPackages :: [PackageInterfaces]
+-- PackageBase -> InterfaceBase -> allVisiblePackages :: [PackageInterfaces]
+-- PackageBase -> InterfaceBase -> srcMap :: Map Module SrcPath
+-- PackageBase -> InterfaceBase -> pkgSrcMap :: Map Unit FilePath
+-- PackageBase -> InterfaceBase -> pkgSrcMap' :: Map Unit FilePath
+-- PackageBase -> InterfaceBase -> pkgSrcLMap' :: Map Unit FilePath
+
+data InterfaceBase = InterfaceBase
+  { countInterfaces :: IO Int
+  , forInterfaces :: (Interface -> IO ()) -> IO ()
+  , getModsVisible :: IO ModuleSet
+  , interfaceByModule :: Module -> IO (Maybe Interface)
+  , insertInterface :: Interface -> IO ()
+  -- visibleIfaces :: [Interface]
+  }
+
+data LinkBase = LinkBase
+  { countLinks :: IO Int
+  , forLinks :: ((Name, Module) -> IO ()) -> IO ()
+  , localLinkBase :: Interface -> IO LinkBase
+  , moduleByName :: Name -> IO (Maybe Module)
+  }
+
+emptyInterfaceBase :: InterfaceBase
+emptyInterfaceBase = InterfaceBase
+  { countInterfaces = pure 0
+  , forInterfaces = \_ -> pure ()
+  , getModsVisible = pure mempty
+  , interfaceByModule = \_ -> pure Nothing
+  , insertInterface = error "emptyInterfaceBase.insertInterface"
+  }
 
 data InterfaceFile = InterfaceFile {
   ifLinkEnv         :: LinkEnv,
@@ -137,8 +181,8 @@ initBinMemSize :: Int
 initBinMemSize = 1024*1024
 
 
-writeInterfaceFile :: FilePath -> InterfaceFile -> IO ()
-writeInterfaceFile filename iface = do
+writeInterfaceFile :: FilePath -> PackageInfo -> InterfaceBase -> LinkBase -> IO ()
+writeInterfaceFile filename packageInfo ifaces homeLinks = do
   bh0 <- openBinMem initBinMemSize
   put_ bh0 binaryInterfaceMagic
   put_ bh0 binaryInterfaceVersion
@@ -167,7 +211,7 @@ writeInterfaceFile filename iface = do
   let bh = setUserData bh0 $ newWriteState (putName bin_symtab)
                                            (putName bin_symtab)
                                            (putFastString bin_dict)
-  putInterfaceFile_ bh iface
+  putInterfaceFile_ bh packageInfo ifaces homeLinks
 
   -- write the symtab pointer at the front of the file
   symtab_p <- tellBin bh
@@ -302,11 +346,19 @@ instance Binary InterfaceFile where
     return (InterfaceFile env info ifaces)
 
 
-putInterfaceFile_ :: BinHandle -> InterfaceFile -> IO ()
-putInterfaceFile_ bh (InterfaceFile env info ifaces) = do
-  put_ bh env
+putInterfaceFile_ :: BinHandle -> PackageInfo -> InterfaceBase -> LinkBase -> IO ()
+putInterfaceFile_ bh info ifaces env = do
+  do
+    n <- countLinks env
+    put_ bh n
+    forLinks env $ put_ bh
+
   put_ bh info
-  put_ bh ifaces
+
+  do
+    n <- countInterfaces ifaces
+    put_ bh n
+    forInterfaces ifaces $ put_ bh . toInstalledIface
 
 instance Binary InstalledInterface where
   put_ bh (InstalledInterface modu is_sig info docMap argMap defMeths

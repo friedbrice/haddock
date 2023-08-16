@@ -41,7 +41,7 @@ import Haddock.GhcUtils (moduleString, pretty)
 import Haddock.Interface.AttachInstances (attachInstances)
 import Haddock.Interface.Create (createInterface1)
 import Haddock.Interface.Rename (renameInterface)
-import Haddock.InterfaceFile (InterfaceFile, ifInstalledIfaces, ifLinkEnv)
+import Haddock.InterfaceFile
 import Haddock.Options hiding (verbosity)
 import Haddock.Types
 import Haddock.Utils (Verbosity (..), normal, out, verbose)
@@ -85,14 +85,15 @@ import GHC.IO.Encoding.Failure (CodingFailureMode(TransliterateCodingFailure))
 -- | Create 'Interface's and a link environment by typechecking the list of
 -- modules using the GHC API and processing the resulting syntax trees.
 processModules
-  :: Verbosity                  -- ^ Verbosity of logging to 'stdout'
+  :: (forall a. Ghc a -> IO a)
+  -> Verbosity                  -- ^ Verbosity of logging to 'stdout'
   -> [String]                   -- ^ A list of file or module names sorted by
                                 -- module topology
   -> [Flag]                     -- ^ Command-line flags
-  -> [InterfaceFile]            -- ^ Interface files of package dependencies
-  -> Ghc ([Interface], LinkEnv) -- ^ Resulting list of interfaces and renaming
+  -> PackageBase            -- ^ Interface files of package dependencies
+  -> Ghc (InterfaceBase, LinkBase) -- ^ Resulting list of interfaces and renaming
                                 -- environment
-processModules verbosity modules flags extIfaces = do
+processModules ghc verbosity modules flags packages = do
 #if defined(mingw32_HOST_OS)
   -- Avoid internal error: <stderr>: hPutChar: invalid argument (invalid character)' non UTF-8 Windows
   liftIO $ hSetEncoding stdout $ mkLocaleEncoding TransliterateCodingFailure
@@ -101,59 +102,45 @@ processModules verbosity modules flags extIfaces = do
 
   dflags <- getDynFlags
 
-  -- Map from a module to a corresponding installed interface
-  let instIfaceMap :: InstIfaceMap
-      instIfaceMap = Map.fromList
-        [ (instMod iface, iface)
-        | ext <- extIfaces
-        , iface <- ifInstalledIfaces ext
-        ]
+  interfaces <- createIfaces ghc verbosity modules flags packages
 
-  interfaces <- createIfaces verbosity modules flags instIfaceMap
-
-  let exportedNames =
-        Set.unions $ map (Set.fromList . ifaceExports) $
-        filter (\i -> not $ OptHide `elem` ifaceOptions i) interfaces
-      mods = Set.fromList $ map ifaceMod interfaces
-
-  interfaces' <- {-# SCC attachInstances #-}
+  () <- {-# SCC attachInstances #-}
                  withTimingM "attachInstances" (const ()) $ do
-                   attachInstances (exportedNames, mods) interfaces instIfaceMap
+                   attachInstances interfaces packages
 
-  -- Combine the link envs of the external packages into one
-  let extLinks  = Map.unions (map ifLinkEnv extIfaces)
-      homeLinks = buildHomeLinks interfaces' -- Build the environment for the home
-                                             -- package
-      links     = homeLinks `Map.union` extLinks
+  homeLinks <- liftIO $ buildHomeLinks interfaces
+
+  links <- liftIO $ addExternalLinks interfaces homeLinks
 
   let warnings = Flag_NoWarnings `notElem` flags
       ignoredSymbolSet = ignoredSymbols flags
 
-  interfaces'' <-
+  () <-
     withTimingM "renameAllInterfaces" (const ()) $
-      for interfaces' $ \i -> do
-        withTimingM ("renameInterface: " <+> pprModuleName (moduleName (ifaceMod i))) (const ()) $
-          renameInterface dflags ignoredSymbolSet links warnings (Flag_Hoogle `elem` flags) i
+      liftIO $ forInterfaces interfaces $ \i -> do
+        ghc $ withTimingM ("renameInterface: " <+> pprModuleName (moduleName (ifaceMod i))) (const ()) $
+          liftIO $ renameInterface dflags ignoredSymbolSet links interfaces warnings (Flag_Hoogle `elem` flags) i
 
-  return (interfaces'', homeLinks)
+  return (interfaces, homeLinks)
 
 --------------------------------------------------------------------------------
 -- * Module typechecking and Interface creation
 --------------------------------------------------------------------------------
 
 createIfaces
-    :: Verbosity
+    :: (forall a. Ghc a -> IO a)
+    -> Verbosity
     -- ^ Verbosity requested by the caller
     -> [String]
     -- ^ List of modules provided as arguments to Haddock (still in FilePath
     -- format)
     -> [Flag]
     -- ^ Command line flags which Hadddock was invoked with
-    -> InstIfaceMap
+    -> PackageBase
     -- ^ Map from module to corresponding installed interface file
-    -> Ghc [Interface]
+    -> Ghc InterfaceBase
     -- ^ Resulting interfaces
-createIfaces verbosity modules flags instIfaceMap = do
+createIfaces ghc verbosity modules flags packages = do
   targets <- mapM (\filePath -> guessTarget filePath Nothing Nothing) modules
   setTargets targets
   (_errs, modGraph) <- depanalE [] False
@@ -207,28 +194,29 @@ createIfaces verbosity modules flags instIfaceMap = do
       -- i.e. if module A imports B, then B is preferred over A,
       -- but if module A {-# SOURCE #-} imports B, then we can't say the same.
       --
-  let
-      go (AcyclicSCC (ModuleNode _ ms))
-        | NotBoot <- isBootSummary ms = [ms]
-        | otherwise = []
-      go (AcyclicSCC _) = []
-      go (CyclicSCC _) = error "haddock: module graph cyclic even with boot files"
+  -- let
+  --     go (AcyclicSCC (ModuleNode _ ms))
+  --       | NotBoot <- isBootSummary ms = [ms]
+  --       | otherwise = []
+  --     go (AcyclicSCC _) = []
+  --     go (CyclicSCC _) = error "haddock: module graph cyclic even with boot files"
 
-      -- Visit modules in that order
-      sortedMods = concatMap go $ topSortModuleGraph False modGraph Nothing
-  out verbosity normal "Haddock coverage:"
-  (ifaces, _) <- foldM f ([], Map.empty) sortedMods
-  return (reverse ifaces)
+  --     -- Visit modules in that order
+  --     sortedMods = concatMap go $ topSortModuleGraph False modGraph Nothing
+  -- out verbosity normal "Haddock coverage:"
+  -- (ifaces, _) <- foldM f ([], Map.empty) sortedMods
+  -- return (reverse ifaces)
+  undefined
   where
-    f (ifaces, ifaceMap) modSummary = do
-      x <- {-# SCC processModule #-}
-           withTimingM "processModule" (const ()) $ do
-             processModule verbosity modSummary flags ifaceMap instIfaceMap
-      return $ case x of
-        Just iface -> ( iface:ifaces
-                      , Map.insert (ifaceMod iface) iface ifaceMap )
-        Nothing    -> ( ifaces
-                      , ifaceMap ) -- Boot modules don't generate ifaces.
+    -- f (ifaces, ifaceMap) modSummary = do
+    --   x <- {-# SCC processModule #-}
+    --        withTimingM "processModule" (const ()) $ do
+    --          processModule verbosity modSummary flags ifaceMap instIfaceMap
+    --   return $ case x of
+    --     Just iface -> ( iface:ifaces
+    --                   , Map.insert (ifaceMod iface) iface ifaceMap )
+    --     Nothing    -> ( ifaces
+    --                   , ifaceMap ) -- Boot modules don't generate ifaces.
 
 dropErr :: MaybeErr e a -> Maybe a
 dropErr (Succeeded a) = Just a
@@ -325,18 +313,23 @@ processModule verbosity modSummary flags ifaceMap instIfaceMap = do
 --
 -- The interfaces are passed in in topologically sorted order, but we start
 -- by reversing the list so we can do a foldl.
-buildHomeLinks :: [Interface] -> LinkEnv
-buildHomeLinks ifaces = foldl' upd Map.empty (reverse ifaces)
-  where
-    upd old_env iface
-      | OptHide `elem` ifaceOptions iface =
-          old_env
-      | OptNotHome `elem` ifaceOptions iface =
-          foldl' keep_old old_env exported_names
-      | otherwise =
-          foldl' keep_new old_env exported_names
-      where
-        exported_names = ifaceVisibleExports iface ++ map getName (ifaceInstances iface)
-        mdl            = ifaceMod iface
-        keep_old env n = Map.insertWith (\_ old -> old) n mdl env
-        keep_new env n = Map.insert n mdl env
+buildHomeLinks :: InterfaceBase -> IO LinkBase
+buildHomeLinks ifaces =
+  undefined ifaces
+  -- foldl' upd Map.empty (reverse ifaces)
+  -- where
+  --   upd old_env iface
+  --     | OptHide `elem` ifaceOptions iface =
+  --         old_env
+  --     | OptNotHome `elem` ifaceOptions iface =
+  --         foldl' keep_old old_env exported_names
+  --     | otherwise =
+  --         foldl' keep_new old_env exported_names
+  --     where
+  --       exported_names = ifaceVisibleExports iface ++ map getName (ifaceInstances iface)
+  --       mdl            = ifaceMod iface
+  --       keep_old env n = Map.insertWith (\_ old -> old) n mdl env
+  --       keep_new env n = Map.insert n mdl env
+
+addExternalLinks :: InterfaceBase -> LinkBase -> IO LinkBase
+addExternalLinks = undefined

@@ -73,6 +73,7 @@ import Haddock.Interface
 import Haddock.Types
 import Haddock.Options
 import Haddock
+import GHC.Driver.Monad
 
 
 -- | Create 'Interface' structures from a given list of Haddock command-line
@@ -80,9 +81,10 @@ import Haddock
 -- that control documentation generation or show help or version information
 -- are ignored.
 createInterfaces
-  :: [Flag]         -- ^ A list of command-line flags
+  :: (forall a. Ghc a -> IO a)
+  -> [Flag]         -- ^ A list of command-line flags
   -> [String]       -- ^ File or module names
-  -> IO [Interface] -- ^ Resulting list of interfaces
-createInterfaces flags modules = do
-  (_, ifaces, _) <- withGhc flags (readPackagesAndProcessModules flags modules)
+  -> IO InterfaceBase -- ^ Resulting list of interfaces
+createInterfaces ghc flags modules = do
+  (_, ifaces, _) <- withGhc flags (readPackagesAndProcessModules ghc flags modules)
   return ifaces

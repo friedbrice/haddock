@@ -2,6 +2,7 @@
 {-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE TypeFamilies               #-}
 {-# LANGUAGE DerivingStrategies         #-}
+{-# LANGUAGE DerivingVia                #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 ----------------------------------------------------------------------------
@@ -23,13 +24,14 @@ import Data.Traversable (mapM)
 import Haddock.Backends.Hoogle (ppExportD)
 import Haddock.GhcUtils
 import Haddock.Types
+import Haddock.InterfaceFile
 
 import GHC.Data.Bag (emptyBag)
 import GHC hiding (NoLink)
 import GHC.Types.Name
 import GHC.Types.Name.Reader (RdrName(Exact))
 import GHC.Builtin.Types (eqTyCon_RDR)
-
+import Data.IORef
 import Control.Applicative
 import Control.DeepSeq (force)
 import Control.Monad hiding (mapM)
@@ -57,41 +59,36 @@ renameInterface
   -- 'Just M' mapping to name 'f' means that link warnings should not be
   -- generated for occurances of specifically 'M.f'. Module 'Nothing' mapping to
   -- name 'f' means that link warnings should not be generated for any 'f'.
-  -> LinkEnv
+  -> LinkBase
   -- ^ Link environment. A map from 'Name' to 'Module', where name 'n' maps to
   -- module 'M' if 'M' is the preferred link destination for name 'n'.
+  -> InterfaceBase
   -> Bool
   -- ^ Are warnings enabled?
   -> Bool
   -- ^ Is Hoogle output enabled?
   -> Interface
   -- ^ The interface we are renaming.
-  -> Ghc Interface
+  -> IO ()
   -- ^ The renamed interface. Note that there is nothing really special about
   -- this being in the 'Ghc' monad. This could very easily be any 'MonadIO' or
   -- even pure, depending on the link warnings are reported.
-renameInterface dflags ignoreSet renamingEnv warnings hoogle iface = do
-    let (iface', warnedNames) =
+renameInterface dflags ignoreSet renamingEnv ifaces warnings hoogle iface = do
+    localLinkBase <- localLinkBase renamingEnv iface
+    (iface', warnedNames) <-
           runRnM
             dflags
             mdl
-            localLinkEnv
+            localLinkBase
             warnName
             (hoogle && not (OptHide `elem` ifaceOptions iface))
             (renameInterfaceRn iface)
     reportMissingLinks mdl warnedNames
-    return iface'
+    insertInterface ifaces iface'
   where
     -- The current module
     mdl :: Module
     mdl = ifaceMod iface
-
-    -- The local link environment, where every name exported by this module is
-    -- mapped to the module itself, and everything else comes from the global
-    -- renaming env
-    localLinkEnv :: LinkEnv
-    localLinkEnv = foldr f renamingEnv (ifaceVisibleExports iface)
-      where f name !env = Map.insert name mdl env
 
     -- The function used to determine whether we should warn about a name
     -- which we do not find in the renaming environment
@@ -127,11 +124,11 @@ renameInterface dflags ignoreSet renamingEnv warnings hoogle iface = do
 -- | Output warning messages indicating that the renamer could not find link
 -- destinations for the names in the given set as they occur in the given
 -- module.
-reportMissingLinks :: Module -> Set.Set Name -> Ghc ()
+reportMissingLinks :: Module -> Set.Set Name -> IO ()
 reportMissingLinks mdl names
     | Set.null names = return ()
     | otherwise =
-        liftIO $ do
+        do
           putStrLn $ "Warning: " ++ moduleString mdl ++ ": could not find link destinations for: "
           traverse_ (putStrLn . ("\t- " ++) . qualifiedName) names
   where
@@ -145,14 +142,31 @@ reportMissingLinks mdl names
 -- | A renaming monad which provides 'MonadReader' access to a renaming
 -- environment, and 'MonadWriter' access to a 'Set' of names for which link
 -- warnings should be generated, based on the renaming environment.
-newtype RnM a = RnM { unRnM :: ReaderT RnMEnv (Writer (Set.Set Name)) a }
-  deriving newtype (Functor, Applicative, Monad, MonadReader RnMEnv, MonadWriter (Set.Set Name))
+newtype RnM a = RnM { unRnM :: RnMEnv -> IO a }
+  deriving (Functor, Applicative, Monad, MonadIO, MonadReader RnMEnv) via ReaderT RnMEnv IO
+
+instance MonadWriter (Set.Set Name) RnM where
+  tell names = do
+    ref <- asks namesRef
+    liftIO $ modifyIORef ref (<> names)
+
+  listen xs = do
+    ref <- asks namesRef
+    names <- liftIO $ readIORef ref
+    x <- xs
+    pure (x, names)
+
+  pass xs = do
+    ref <- asks namesRef
+    (x, f) <- xs
+    liftIO $ modifyIORef ref f
+    pure x
 
 -- | The renaming monad environment. Stores the linking environment (mapping
 -- names to modules), the link warning predicate, and the current module.
 data RnMEnv = RnMEnv
     { -- | The linking environment (map from names to modules)
-      rnLinkEnv      :: LinkEnv
+      rnLinkEnv      :: LinkBase
 
       -- | Link warning predicate (whether failing to find a link destination
       -- for a given name should result in a warning)
@@ -166,24 +180,26 @@ data RnMEnv = RnMEnv
 
       -- | GHC Session DynFlags, necessary for Hoogle output generation
     , rnDynFlags :: DynFlags
+    , namesRef :: IORef (Set.Set Name)
     }
 
 -- | Run the renamer action in a renaming environment built using the given
 -- module, link env, and link warning predicate. Returns the renamed value along
 -- with a set of 'Name's that were not renamed and should be warned for (i.e.
 -- they satisfied the link warning predicate).
-runRnM :: DynFlags -> Module -> LinkEnv -> (Name -> Bool) -> Bool -> RnM a -> (a, Set.Set Name)
-runRnM dflags mdl linkEnv warnName hoogleOutput rn =
-    runWriter $ runReaderT (unRnM rn) rnEnv
-  where
-    rnEnv :: RnMEnv
-    rnEnv = RnMEnv
-      { rnLinkEnv      = linkEnv
-      , rnWarnName     = warnName
-      , rnModuleString = moduleString mdl
-      , rnHoogleOutput = hoogleOutput
-      , rnDynFlags     = dflags
-      }
+runRnM :: DynFlags -> Module -> LinkBase -> (Name -> Bool) -> Bool -> RnM a -> IO (a, Set.Set Name)
+runRnM dflags mdl linkEnv warnName hoogleOutput rn = do
+  namesRef <- newIORef mempty
+  a <- unRnM rn RnMEnv
+    { rnLinkEnv      = linkEnv
+    , rnWarnName     = warnName
+    , rnModuleString = moduleString mdl
+    , rnHoogleOutput = hoogleOutput
+    , rnDynFlags     = dflags
+    , namesRef       = namesRef
+    }
+  names <- readIORef namesRef
+  pure (a, names)
 
 --------------------------------------------------------------------------------
 -- Renaming
@@ -209,9 +225,10 @@ renameInterfaceRn iface = do
 
 -- | Lookup a 'Name' in the renaming environment.
 lookupRn :: Name -> RnM DocName
-lookupRn name = RnM $ do
+lookupRn name = do
     linkEnv <- asks rnLinkEnv
-    case Map.lookup name linkEnv of
+    home <- liftIO $ moduleByName linkEnv name
+    case home of
       Nothing  -> return $ Undocumented name
       Just mdl -> return $ Documented name mdl
 

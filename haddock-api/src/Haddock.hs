@@ -200,7 +200,8 @@ haddockWithGhc ghc args = handleTopExceptions $ do
     when noChecks $
       hPutStrLn stderr noCheckWarning
 
-  ghc flags' $ withDir $ do
+  let ghc' = ghc flags'
+  ghc' $ withDir $ do
     dflags <- getDynFlags
     logger <- getLogger
     !unit_state <- hsc_units <$> getSession
@@ -209,12 +210,12 @@ haddockWithGhc ghc args = handleTopExceptions $ do
     forM_ (optShowInterfaceFile flags) $ \path -> liftIO $ do
       name_cache <- freshNameCache
       mIfaceFile <- readInterfaceFiles name_cache [(("", Nothing), Visible, path)] noChecks
-      forM_ mIfaceFile $ \(_,_,_, ifaceFile) -> do
+      forPackages mIfaceFile $ \(_,_,_, ifaceFile) -> do
         putMsg logger $ renderJson (jsonInterfaceFile ifaceFile)
 
     -- If we were given source files to generate documentation from, do it
     if not (null files) then do
-      (packages, ifaces, homeLinks) <- readPackagesAndProcessModules flags files
+      (packages, ifaces, homeLinks) <- readPackagesAndProcessModules ghc' flags files
       let packageInfo = PackageInfo { piPackageName =
                                         fromMaybe (PackageName mempty) (optPackageName flags)
                                     , piPackageVersion =
@@ -223,11 +224,7 @@ haddockWithGhc ghc args = handleTopExceptions $ do
 
       -- Dump an "interface file" (.haddock file), if requested.
       forM_ (optDumpInterfaceFile flags) $ \path -> liftIO $ do
-        writeInterfaceFile path InterfaceFile {
-            ifInstalledIfaces = map toInstalledIface ifaces
-          , ifPackageInfo     = packageInfo
-          , ifLinkEnv         = homeLinks
-          }
+        writeInterfaceFile path packageInfo ifaces homeLinks
 
       -- Render the interfaces.
       liftIO $ renderStep logger dflags unit_state flags sinceQual qual packages ifaces
@@ -243,7 +240,7 @@ haddockWithGhc ghc args = handleTopExceptions $ do
       packages <- liftIO $ readInterfaceFiles name_cache (readIfaceArgs flags) noChecks
 
       -- Render even though there are no input files (usually contents/index).
-      liftIO $ renderStep logger dflags unit_state flags sinceQual qual packages []
+      liftIO $ renderStep logger dflags unit_state flags sinceQual qual packages emptyInterfaceBase
 
 -- | Run the GHC action using a temporary output directory
 withTempOutputDir :: Ghc a -> Ghc a
@@ -278,9 +275,10 @@ withGhc flags action = do
   withGhc' libDir needHieFiles (ghcFlags flags) (\_ -> handleSrcErrors action)
 
 
-readPackagesAndProcessModules :: [Flag] -> [String]
-                              -> Ghc ([(DocPaths, Visibility, FilePath, InterfaceFile)], [Interface], LinkEnv)
-readPackagesAndProcessModules flags files = do
+readPackagesAndProcessModules :: (forall a. Ghc a -> IO a)
+                              -> [Flag] -> [String]
+                              -> Ghc (PackageBase, InterfaceBase, LinkBase)
+readPackagesAndProcessModules ghc flags files = do
     -- Whether or not we bypass the interface file version check
     let noChecks = Flag_BypassInterfaceVersonCheck `elem` flags
 
@@ -289,31 +287,29 @@ readPackagesAndProcessModules flags files = do
     packages <- liftIO $ readInterfaceFiles name_cache (readIfaceArgs flags) noChecks
 
     -- Create the interfaces for the given modules -- this is the core part of Haddock
-    let ifaceFiles = map (\(_, _, _, ifaceFile) -> ifaceFile) packages
-    (ifaces, homeLinks) <- processModules (verbosity flags) files flags ifaceFiles
+    (ifaces, homeLinks) <- processModules ghc (verbosity flags) files flags packages
 
     return (packages, ifaces, homeLinks)
 
 
 renderStep :: Logger -> DynFlags -> UnitState -> [Flag] -> SinceQual -> QualOption
-           -> [(DocPaths, Visibility, FilePath, InterfaceFile)] -> [Interface] -> IO ()
+           -> PackageBase -> InterfaceBase -> IO ()
 renderStep logger dflags unit_state flags sinceQual nameQual pkgs interfaces = do
-  updateHTMLXRefs (map (\(docPath, _ifaceFilePath, _showModules, ifaceFile) ->
-                          ( case baseUrl flags of
-                              Nothing  -> fst docPath
-                              Just url -> url </> packageName (ifUnitId ifaceFile)
-                          , ifaceFile)) pkgs)
+  updateHTMLXRefs pkgs
   let
+    installedIfaces :: [(FilePath, PackageInterfaces)]
     installedIfaces =
       map
         (\(_, showModules, ifaceFilePath, ifaceFile)
           -> (ifaceFilePath, mkPackageInterfaces showModules ifaceFile))
-        pkgs
+        -- pkgs
+        (undefined :: [(a, Visibility, FilePath, InterfaceFile)])
+    extSrcMap :: Map Module FilePath
     extSrcMap = Map.fromList $ do
-      ((_, Just path), _, _, ifile) <- pkgs
+      ((_, Just path), _, _, ifile) <- (undefined :: [((a, Maybe FilePath), Visibility, FilePath, InterfaceFile)]) -- pkgs
       iface <- ifInstalledIfaces ifile
       return (instMod iface, path)
-  render logger dflags unit_state flags sinceQual nameQual interfaces installedIfaces extSrcMap
+  render logger dflags unit_state flags sinceQual nameQual interfaces pkgs
   where
     -- get package name from unit-id
     packageName :: Unit -> String
@@ -323,9 +319,9 @@ renderStep logger dflags unit_state flags sinceQual nameQual pkgs interfaces = d
         Just pkg -> unitPackageNameString pkg
 
 -- | Render the interfaces with whatever backend is specified in the flags.
-render :: Logger -> DynFlags -> UnitState -> [Flag] -> SinceQual -> QualOption -> [Interface]
-       -> [(FilePath, PackageInterfaces)] -> Map Module FilePath -> IO ()
-render log' dflags unit_state flags sinceQual qual ifaces packages extSrcMap = do
+render :: Logger -> DynFlags -> UnitState -> [Flag] -> SinceQual -> QualOption -> InterfaceBase
+       -> PackageBase -> IO ()
+render log' dflags unit_state flags sinceQual qual ifaces packages = do
 
   let
     packageInfo = PackageInfo { piPackageName    = fromMaybe (PackageName mempty)
@@ -350,7 +346,8 @@ render log' dflags unit_state flags sinceQual qual ifaces packages extSrcMap = d
       | otherwise        = dflags
     logger               = setLogFlags log' (initLogFlags dflags')
 
-    visibleIfaces    = [ i | i <- ifaces, OptHide `notElem` ifaceOptions i ]
+    visibleIfaces :: [Interface]
+    visibleIfaces    = [ i | i <- error "ifaces" :: [Interface], OptHide `notElem` ifaceOptions i ]
 
     -- /All/ interfaces including external package modules, grouped by
     -- interface file (package).
@@ -358,9 +355,9 @@ render log' dflags unit_state flags sinceQual qual ifaces packages extSrcMap = d
     allPackages      = [PackageInterfaces
                          { piPackageInfo = packageInfo
                          , piVisibility  = Visible
-                         , piInstalledInterfaces  = map toInstalledIface ifaces
+                         , piInstalledInterfaces  = map toInstalledIface (error "ifaces" :: [Interface])
                          }]
-                    ++ map snd packages
+                    ++ map snd (error "packages" :: [(FilePath, PackageInterfaces)])
 
     -- /All/ visible interfaces including external package modules, grouped by
     -- interface file (package).
@@ -377,9 +374,9 @@ render log' dflags unit_state flags sinceQual qual ifaces packages extSrcMap = d
 
     -- /All/ installed interfaces.
     allInstalledIfaces :: [InstalledInterface]
-    allInstalledIfaces = concatMap (piInstalledInterfaces . snd) packages
+    allInstalledIfaces = concatMap (piInstalledInterfaces . snd) (error "packages" :: [(FilePath, PackageInterfaces)])
 
-    pkgMod           = fmap ifaceMod (listToMaybe ifaces)
+    pkgMod           = fmap ifaceMod (listToMaybe (error "ifaces" :: [Interface]))
     pkgKey           = fmap moduleUnit pkgMod
     pkgStr           = fmap unitString pkgKey
     pkgNameVer       = modulePackageInfo unit_state flags pkgMod
@@ -394,11 +391,16 @@ render log' dflags unit_state flags sinceQual qual ifaces packages extSrcMap = d
       | Flag_HyperlinkedSource `elem` flags = Just hypSrcModuleUrlFormat
       | otherwise = srcModule
 
-    srcMap = Map.union
-      (Map.map SrcExternal extSrcMap)
-      (Map.fromList [ (ifaceMod iface, SrcLocal) | iface <- ifaces ])
+    srcMap :: Map Module SrcPath
+    srcMap = undefined
+    -- srcMap = Map.union
+    --   (Map.map SrcExternal extSrcMap)
+    --   (Map.fromList [ (ifaceMod iface, SrcLocal) | iface <- ifaces ])
 
-    pkgSrcMap = Map.mapKeys moduleUnit extSrcMap
+    pkgSrcMap :: Map Unit FilePath
+    pkgSrcMap = Map.mapKeys moduleUnit (error "extSrcMap" :: Map Module FilePath)
+
+    pkgSrcMap' :: Map Unit FilePath
     pkgSrcMap'
       | Flag_HyperlinkedSource `elem` flags
       , Just k <- pkgKey
@@ -409,6 +411,7 @@ render log' dflags unit_state flags sinceQual qual ifaces packages extSrcMap = d
       | otherwise = pkgSrcMap
 
     -- TODO: Get these from the interface files as with srcMap
+    pkgSrcLMap' :: Map Unit FilePath
     pkgSrcLMap'
       | Flag_HyperlinkedSource `elem` flags
       , Just k <- pkgKey
@@ -478,11 +481,11 @@ render log' dflags unit_state flags sinceQual qual ifaces packages extSrcMap = d
   when withQuickjump $ void $
             ppJsonIndex odir sourceUrls' opt_wiki_urls
                         unicode Nothing qual
-                        ifaces
+                        (error "ifaces" :: [Interface])
                         ( nub
                         . map fst
                         . filter ((== Visible) . piVisibility . snd)
-                        $ packages)
+                        $ (error "packages" :: [(FilePath, PackageInterfaces)]))
 
   when (Flag_Html `elem` flags) $ do
     withTiming logger "ppHtml" (const ()) $ do
@@ -527,10 +530,10 @@ render log' dflags unit_state flags sinceQual qual ifaces packages extSrcMap = d
                    libDir
       return ()
 
-  when (Flag_HyperlinkedSource `elem` flags && not (null ifaces)) $ do
+  when (Flag_HyperlinkedSource `elem` flags && not (null (error "ifaces" :: [Interface]))) $ do
     withTiming logger "ppHyperlinkedSource" (const ()) $ do
       _ <- {-# SCC ppHyperlinkedSource #-}
-           ppHyperlinkedSource (verbosity flags) odir libDir opt_source_css pretty srcMap ifaces
+           ppHyperlinkedSource (verbosity flags) odir libDir opt_source_css pretty srcMap (error "ifaces" :: [Interface])
       return ()
 
 
@@ -542,19 +545,20 @@ render log' dflags unit_state flags sinceQual qual ifaces packages extSrcMap = d
 readInterfaceFiles :: NameCache
                    -> [(DocPaths, Visibility, FilePath)]
                    -> Bool
-                   -> IO [(DocPaths, Visibility, FilePath, InterfaceFile)]
+                   -> IO PackageBase
 readInterfaceFiles name_cache_accessor pairs bypass_version_check = do
-  catMaybes `liftM` mapM ({-# SCC readInterfaceFile #-} tryReadIface) pairs
-  where
-    -- try to read an interface, warn if we can't
-    tryReadIface (paths, vis, file) =
-      readInterfaceFile name_cache_accessor file bypass_version_check >>= \case
-        Left err -> do
-          putStrLn ("Warning: Cannot read " ++ file ++ ":")
-          putStrLn ("   " ++ err)
-          putStrLn "Skipping this interface."
-          return Nothing
-        Right f -> return (Just (paths, vis, file, f))
+  undefined
+  -- catMaybes `liftM` mapM ({-# SCC readInterfaceFile #-} tryReadIface) pairs
+  -- where
+  --   -- try to read an interface, warn if we can't
+  --   tryReadIface (paths, vis, file) =
+  --     readInterfaceFile name_cache_accessor file bypass_version_check >>= \case
+  --       Left err -> do
+  --         putStrLn ("Warning: Cannot read " ++ file ++ ":")
+  --         putStrLn ("   " ++ err)
+  --         putStrLn "Skipping this interface."
+  --         return Nothing
+  --       Right f -> return (Just (paths, vis, file, f))
 
 
 -------------------------------------------------------------------------------
@@ -783,16 +787,17 @@ hypSrcWarnings flags = do
     isSourceCssFlag _ = False
 
 
-updateHTMLXRefs :: [(FilePath, InterfaceFile)] -> IO ()
+updateHTMLXRefs :: PackageBase -> IO ()
 updateHTMLXRefs packages = do
-  let !modMap     = force $ Map.fromList mapping
-      !modNameMap = force $ Map.fromList mapping'
-  writeIORef html_xrefs_ref  modMap
-  writeIORef html_xrefs_ref' modNameMap
-  where
-    mapping = [ (instMod iface, html) | (html, ifaces) <- packages
-              , iface <- ifInstalledIfaces ifaces ]
-    mapping' = [ (moduleName m, html) | (m, html) <- mapping ]
+  undefined
+  -- let !modMap     = force $ Map.fromList mapping
+  --     !modNameMap = force $ Map.fromList mapping'
+  -- writeIORef html_xrefs_ref  modMap
+  -- writeIORef html_xrefs_ref' modNameMap
+  -- where
+  --   mapping = [ (instMod iface, html) | (html, ifaces) <- packages
+  --             , iface <- ifInstalledIfaces ifaces ]
+  --   mapping' = [ (moduleName m, html) | (m, html) <- mapping ]
 
 
 getPrologue :: DynFlags -> [Flag] -> IO (Maybe (MDoc RdrName))
